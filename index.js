@@ -1,5 +1,3 @@
-// index.js (fixed version)
-
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
@@ -27,6 +25,7 @@ app.post('/merge', async (req, res) => {
 
     const downloadedFiles = [];
 
+    // Download videos
     for (const videoUrl of inputVideos) {
       const filename = `${uuidv4()}.mp4`;
       const filepath = path.join(tempDir, filename);
@@ -47,25 +46,34 @@ app.post('/merge', async (req, res) => {
       downloadedFiles.push(filepath);
     }
 
+    // Prepare output file
     const outputFilename = `merged_${Date.now()}.mp4`;
     const outputPath = path.join(tempDir, outputFilename);
 
-    const ffmpegCommand = ffmpeg();
-    downloadedFiles.forEach(file => ffmpegCommand.input(file));
+    // Create file list for FFmpeg concat demuxer
+    const fileListPath = path.join(tempDir, 'filelist.txt');
+    const fileListContent = downloadedFiles.map(file => `file '${file}'`).join('\n');
+    fs.writeFileSync(fileListPath, fileListContent);
 
-    ffmpegCommand
+    // Merge videos using concat demuxer
+    ffmpeg()
+      .input(fileListPath)
+      .inputOptions(['-f', 'concat', '-safe', '0'])
+      .outputOptions(['-c', 'copy'])
+      .output(outputPath)
+      .on('end', () => {
+        res.download(outputPath, () => {
+          // Cleanup files
+          downloadedFiles.forEach(file => fs.unlinkSync(file));
+          fs.unlinkSync(outputPath);
+          fs.unlinkSync(fileListPath);
+        });
+      })
       .on('error', (err) => {
         console.error('Error merging videos:', err);
         res.status(500).json({ error: 'Merging failed.' });
       })
-      .on('end', () => {
-        res.download(outputPath, () => {
-          // Cleanup temp files
-          downloadedFiles.forEach(file => fs.unlinkSync(file));
-          fs.unlinkSync(outputPath);
-        });
-      })
-      .mergeToFile(outputPath);
+      .run();
 
   } catch (error) {
     console.error('Server error:', error);
