@@ -1,65 +1,86 @@
+// Required modules
 const express = require('express');
-const multer  = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 
+// Initialize app
 const app = express();
 const port = process.env.PORT || 3000;
-const upload = multer({ dest: 'uploads/' });
 
+// Middlewares
 app.use(express.json());
 
-// Existing /convert endpoint
-app.post('/convert', upload.fields([{ name: 'audio' }, { name: 'image' }]), (req, res) => {
-  const audioPath = req.files['audio'][0].path;
-  const imagePath = req.files['image'][0].path;
-  const outputPath = `output_${Date.now()}.mp4`;
+// Merge videos endpoint
+app.post('/merge', async (req, res) => {
+  const { input_videos } = req.body;
 
-  ffmpeg()
-    .input(imagePath)
-    .loop(5)
-    .input(audioPath)
-    .outputOptions('-c:v libx264', '-c:a aac', '-shortest')
-    .save(outputPath)
-    .on('end', () => {
-      res.download(outputPath, () => {
-        fs.unlinkSync(audioPath);
-        fs.unlinkSync(imagePath);
-        fs.unlinkSync(outputPath);
+  if (!input_videos || !Array.isArray(input_videos) || input_videos.length === 0) {
+    return res.status(400).json({ error: 'input_videos must be a non-empty array' });
+  }
+
+  const tempDir = path.join(__dirname, 'temp');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir);
+  }
+
+  try {
+    // Step 1: Download all videos locally
+    const downloadedFiles = [];
+    for (const url of input_videos) {
+      const response = await axios({
+        method: 'GET',
+        url,
+        responseType: 'stream'
       });
-    })
-    .on('error', err => {
-      res.status(500).send('Conversion failed: ' + err.message);
+      const tempFileName = path.join(tempDir, uuidv4() + '.mp4');
+      const writer = fs.createWriteStream(tempFileName);
+      response.data.pipe(writer);
+
+      await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+
+      downloadedFiles.push(tempFileName);
+    }
+
+    // Step 2: Create file list for ffmpeg concat
+    const fileListPath = path.join(tempDir, 'filelist.txt');
+    fs.writeFileSync(fileListPath, downloadedFiles.map(file => `file '${file}'`).join('\n'));
+
+    // Step 3: Merge videos
+    const outputFile = path.join(tempDir, `merged_${Date.now()}.mp4`);
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(fileListPath)
+        .inputOptions('-f concat', '-safe 0')
+        .outputOptions('-c copy')
+        .output(outputFile)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
     });
+
+    // Step 4: Send merged file
+    res.download(outputFile, async () => {
+      // Cleanup temp files after sending
+      [...downloadedFiles, fileListPath, outputFile].forEach(file => {
+        fs.unlink(file, (err) => {
+          if (err) console.error('Failed to delete', file);
+        });
+      });
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to merge videos', details: error.message });
+  }
 });
 
-// New /merge endpoint
-app.post('/merge', upload.array('videos', 10), (req, res) => {
-  const videoPaths = req.files.map(file => file.path);
-  const outputPath = `merged_${Date.now()}.mp4`;
-
-  const fileListPath = `filelist_${Date.now()}.txt`;
-  const fileListContent = videoPaths.map(path => `file '${path}'`).join('\n');
-  fs.writeFileSync(fileListPath, fileListContent);
-
-  ffmpeg()
-    .input(fileListPath)
-    .inputOptions('-f concat', '-safe 0')
-    .outputOptions('-c copy')
-    .save(outputPath)
-    .on('end', () => {
-      res.download(outputPath, () => {
-        videoPaths.forEach(path => fs.unlinkSync(path));
-        fs.unlinkSync(fileListPath);
-        fs.unlinkSync(outputPath);
-      });
-    })
-    .on('error', (err) => {
-      res.status(500).send('Merging failed: ' + err.message);
-    });
-});
-
+// Start server
 app.listen(port, () => {
   console.log(`FFmpeg API server listening on port ${port}`);
 });
